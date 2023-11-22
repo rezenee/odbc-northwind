@@ -228,6 +228,8 @@ void addOrder(SQLHDBC dbc) {
                      SQL_INTEGER, 0, 0, &status_id, 0, NULL);
     printf("Enter the ShipAddress: ");
     SQLVARCHAR* ship_addr = readAndBindTinyText(hstmt, 7);
+    return_values = realloc(return_values, ++number_attr_values * sizeof(void*));
+    return_values[number_attr_values-1] = ship_addr;
 
     SQLRETURN ret = SQLExecute(hstmt);
     if(!SQL_SUCCEEDED(ret)) {
@@ -372,17 +374,59 @@ void deleteOrder(SQLHDBC dbc) {
     SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
     free(order_id);
 }
+PRODUCT_INFO** read_products(SQLHDBC dbc) {
+    size_t total_products = 0;
+    PRODUCT_INFO** products_available = malloc(sizeof(PRODUCT_INFO) * total_products);
+    // get information about every productID
+    SQLCHAR* insert = (SQLCHAR*)"SELECT TransactionID, ProductID, Quantity, TransactionType FROM Inventory_Transactions";
+    SQLExecDirect(hstmt, insert, SQL_NTS);
+    SQLINTEGER tid;
+    SQLINTEGER pid;
+    SQLINTEGER quantity;
+    SQLINTEGER transaction_type;
+    SQLBindCol(hstmt, 1, SQL_INTEGER, &tid, sizeof(tid), NULL);
+    SQLBindCol(hstmt, 2, SQL_INTEGER, &pid, sizeof(pid), NULL);
+    SQLBindCol(hstmt, 3, SQL_INTEGER, &quantity, sizeof(quantity), NULL);
+    SQLBindCol(hstmt, 4, SQL_INTEGER, &transaction_type, sizeof(transaction_type), NULL);
+    char* input = NULL;
+    size_t n = 0;
+    while(SQL_SUCCEEDED(SQLFetch(hstmt))) {
+        // figure out if this PID has been read already
+        bool new = 1;
+        for(int i = 0; i < total_products; i++) {
+            if(products_available[i]->pid == pid) {
+                new = 0;
+                if(transaction_type == 1) {
+                    products_available[i]->quantity_avail += quantity;
+                }
+                if(transaction_type == 2 || transaction_type == 3) {
+                    products_available[i]->quantity_avail -= quantity;
+                }
+            }
+        }
+        if(new) {
+            products_available = realloc(products_available, sizeof(PRODUCT_INFO) * ++total_products);
+            products_available[total_products-1] = malloc(sizeof(PRODUCT_INFO));
+            products_available[total_products-1]->pid = pid;
+            // this is a purchase transaction
+            if(transaction_type == 1) {
+                products_available[total_products-1]->quantity_avail = quantity;
+            }
+            // this is a sold or on hold
+            else if(transaction_type == 2 || transaction_type == 3) {
+                products_available[total_products-1]->quantity_avail = 0 - quantity;
+            }
+        }
+    }
+}
+
 void shipOrder(SQLHDBC dbc) {
-    // for errors
-    SQLCHAR sqlState[6];
-    SQLINTEGER nativeError;
-    SQLCHAR messageText[SQL_MAX_MESSAGE_LENGTH];
-    SQLSMALLINT textLength;
     // handle setup and starting transaction
     SQLHSTMT hstmt;
     SQLAllocHandle(SQL_HANDLE_STMT, dbc, &hstmt);
     SQLExecDirect(hstmt, (SQLCHAR*)"BEGIN", SQL_NTS);
     
+
     size_t total_products = 0;
     PRODUCT_INFO** products_available = malloc(sizeof(PRODUCT_INFO) * total_products);
     // get information about every productID
@@ -457,6 +501,8 @@ void shipOrder(SQLHDBC dbc) {
     SQLPrepare(hstmt, insert, SQL_NTS);
     SQLBindParameter(hstmt, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &oid, 0, NULL);
     SQL_TIMESTAMP_STRUCT shipped_date_before;
+     memset(&shipped_date_before, 0, sizeof(shipped_date_before));
+
     SQLBindCol(hstmt, 1, SQL_C_TYPE_TIMESTAMP, &shipped_date_before, sizeof(shipped_date_before), NULL);
     ret = SQLExecute(hstmt);
     if(!SQL_SUCCEEDED(ret)) {
@@ -541,8 +587,6 @@ void shipOrder(SQLHDBC dbc) {
     SQLBindParameter(hstmt, 4, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &oid, 0, NULL);
     ret = SQLExecute(hstmt);
     if(!SQL_SUCCEEDED(ret)) {
-        SQLGetDiagRec(SQL_HANDLE_STMT, hstmt, 1, sqlState, &nativeError, messageText, sizeof(messageText), &textLength);
-        printf("Error: %s - %s\n", sqlState, messageText);
         printf("Rolling Back bad update\n");
         SQLExecDirect(hstmt2, (SQLCHAR*)"ROLLBACK", SQL_NTS);
         SQLExecDirect(hstmt, (SQLCHAR*)"ROLLBACK", SQL_NTS);
