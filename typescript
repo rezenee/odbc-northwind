@@ -1,0 +1,29 @@
+make
+./a4
+1                      // adding customer
+COMPANY
+First
+Last
+first.last@email.com
+(269)999-9999
+601 e mich
+2                     // adding order
+8
+1
+1
+0
+ship address lane
+y                     // saying yes to product
+52
+2
+25.75
+2.50
+n                     // saying no to further product
+4                     // shipping order
+90
+1
+250
+3                     // deleting the order I just created
+90
+5                     // printing
+7                     // finishing

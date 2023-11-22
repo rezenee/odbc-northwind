@@ -1,0 +1,26 @@
+My /etc/odbc.ini looks like 
+[mydsn]
+Driver      = MariaDB
+Socket      = /run/mysqld/mysqld.sock
+Database    = northwind
+Server      = localhost
+Uid         = cs4430
+Password    = cs4430
+Port        = 3306
+
+My /etc/odbcinst.ini looks like 
+[MariaDB]
+Description = ODBC Driver for MariaDB
+Driver      = /usr/lib/libmaodbc.so
+Fileusage   = 1
+
+To run the program run make in the directory. Make sure you have mariadb-odbc installed.
+Also note, I compile with -lm.
+
+the package for the driver that I used is
+yay -S mariadb-connector-odbc
+for the odbc generic I used
+pacman -S unixodbc
+
+
+
