@@ -10,6 +10,7 @@
 
 void userLoop(SQLHDBC);
 void addCustomer(SQLHDBC);
+void rollbackCleanupShip(PRODUCT_INFO**, size_t, SQLHSTMT);
 double getDoubleFromSQLNumericStruct(SQL_NUMERIC_STRUCT*);
 void** bindAttrsCustomer(SQLHSTMT, size_t*);
 
@@ -374,62 +375,13 @@ void deleteOrder(SQLHDBC dbc) {
     SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
     free(order_id);
 }
-PRODUCT_INFO** read_products(SQLHDBC dbc) {
-    size_t total_products = 0;
-    PRODUCT_INFO** products_available = malloc(sizeof(PRODUCT_INFO) * total_products);
+PRODUCT_INFO** read_products(SQLHDBC dbc, size_t* total_products) {
+    PRODUCT_INFO** products_available = malloc(sizeof(PRODUCT_INFO) * *total_products);
     // get information about every productID
-    SQLCHAR* insert = (SQLCHAR*)"SELECT TransactionID, ProductID, Quantity, TransactionType FROM Inventory_Transactions";
-    SQLExecDirect(hstmt, insert, SQL_NTS);
-    SQLINTEGER tid;
-    SQLINTEGER pid;
-    SQLINTEGER quantity;
-    SQLINTEGER transaction_type;
-    SQLBindCol(hstmt, 1, SQL_INTEGER, &tid, sizeof(tid), NULL);
-    SQLBindCol(hstmt, 2, SQL_INTEGER, &pid, sizeof(pid), NULL);
-    SQLBindCol(hstmt, 3, SQL_INTEGER, &quantity, sizeof(quantity), NULL);
-    SQLBindCol(hstmt, 4, SQL_INTEGER, &transaction_type, sizeof(transaction_type), NULL);
-    char* input = NULL;
-    size_t n = 0;
-    while(SQL_SUCCEEDED(SQLFetch(hstmt))) {
-        // figure out if this PID has been read already
-        bool new = 1;
-        for(int i = 0; i < total_products; i++) {
-            if(products_available[i]->pid == pid) {
-                new = 0;
-                if(transaction_type == 1) {
-                    products_available[i]->quantity_avail += quantity;
-                }
-                if(transaction_type == 2 || transaction_type == 3) {
-                    products_available[i]->quantity_avail -= quantity;
-                }
-            }
-        }
-        if(new) {
-            products_available = realloc(products_available, sizeof(PRODUCT_INFO) * ++total_products);
-            products_available[total_products-1] = malloc(sizeof(PRODUCT_INFO));
-            products_available[total_products-1]->pid = pid;
-            // this is a purchase transaction
-            if(transaction_type == 1) {
-                products_available[total_products-1]->quantity_avail = quantity;
-            }
-            // this is a sold or on hold
-            else if(transaction_type == 2 || transaction_type == 3) {
-                products_available[total_products-1]->quantity_avail = 0 - quantity;
-            }
-        }
-    }
-}
-
-void shipOrder(SQLHDBC dbc) {
-    // handle setup and starting transaction
     SQLHSTMT hstmt;
     SQLAllocHandle(SQL_HANDLE_STMT, dbc, &hstmt);
     SQLExecDirect(hstmt, (SQLCHAR*)"BEGIN", SQL_NTS);
-    
 
-    size_t total_products = 0;
-    PRODUCT_INFO** products_available = malloc(sizeof(PRODUCT_INFO) * total_products);
-    // get information about every productID
     SQLCHAR* insert = (SQLCHAR*)"SELECT TransactionID, ProductID, Quantity, TransactionType FROM Inventory_Transactions";
     SQLExecDirect(hstmt, insert, SQL_NTS);
     SQLINTEGER tid;
@@ -445,7 +397,7 @@ void shipOrder(SQLHDBC dbc) {
     while(SQL_SUCCEEDED(SQLFetch(hstmt))) {
         // figure out if this PID has been read already
         bool new = 1;
-        for(int i = 0; i < total_products; i++) {
+        for(int i = 0; i < *total_products; i++) {
             if(products_available[i]->pid == pid) {
                 new = 0;
                 if(transaction_type == 1) {
@@ -457,72 +409,115 @@ void shipOrder(SQLHDBC dbc) {
             }
         }
         if(new) {
-            products_available = realloc(products_available, sizeof(PRODUCT_INFO) * ++total_products);
-            products_available[total_products-1] = malloc(sizeof(PRODUCT_INFO));
-            products_available[total_products-1]->pid = pid;
+            products_available = realloc(products_available, sizeof(PRODUCT_INFO) *
+                                                                        ++(*total_products));
+            products_available[*total_products-1] = malloc(sizeof(PRODUCT_INFO));
+            products_available[*total_products-1]->pid = pid;
             // this is a purchase transaction
             if(transaction_type == 1) {
-                products_available[total_products-1]->quantity_avail = quantity;
+                products_available[*total_products-1]->quantity_avail = quantity;
             }
             // this is a sold or on hold
             else if(transaction_type == 2 || transaction_type == 3) {
-                products_available[total_products-1]->quantity_avail = 0 - quantity;
+                products_available[*total_products-1]->quantity_avail = 0 - quantity;
             }
         }
     }
+    SQLExecDirect(hstmt, (SQLCHAR*)"COMMIT", SQL_NTS);
+    SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
+    free(input);
+    return products_available;
+}
 
-    // TODO ask for orderID to be shipped
-    printf("Enter orderID to be shipped: ");
-    getline(&input, &n, stdin);
-    SQLINTEGER oid = atoi(input);
-    // before doing anything make sure this id actually exists
-    SQLFreeStmt(hstmt, SQL_CLOSE);
-    insert = (SQLCHAR*)"SELECT COUNT(*) FROM Orders WHERE OrderID=?";
+int orderExists(SQLHSTMT dbc, SQLINTEGER oid) {
+    SQLHSTMT hstmt;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &hstmt);
+    SQLCHAR* insert = (SQLCHAR*)"SELECT COUNT(*) FROM Orders WHERE OrderID=?";
+    SQLPrepare(hstmt, insert, SQL_NTS);
+    // binding orderID to stmt
+    SQLBindParameter(hstmt, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &oid, 0, NULL);
+
+    SQLINTEGER check = 0;
+    SQLBindCol(hstmt, 1, SQL_INTEGER, &check, sizeof(check), NULL);
+    SQLRETURN ret = SQLExecute(hstmt);
+    // if the statement is invalid for some reason
+    if(!SQL_SUCCEEDED(ret)) {
+        SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
+        return 0;
+    }
+    SQLFetch(hstmt);
+    SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
+    if(check) {
+        return 1;
+    }
+    return 0;
+}
+SQL_TIMESTAMP_STRUCT getShippedDate(SQLHDBC dbc, SQLINTEGER oid) {
+    SQLHSTMT hstmt;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &hstmt);
+    // figuring out if the order has already been shipped
+    SQLCHAR* insert = (SQLCHAR*)"SELECT ShippedDate FROM Orders WHERE OrderID=?";
     SQLPrepare(hstmt, insert, SQL_NTS);
     SQLBindParameter(hstmt, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &oid, 0, NULL);
-    SQLINTEGER check=0;
-    SQLBindCol(hstmt, 1, SQL_INTEGER, &check, sizeof(check), NULL);
+    SQL_TIMESTAMP_STRUCT shipped_date_before;
+    memset(&shipped_date_before, 0, sizeof(shipped_date_before));
+    SQLBindCol(hstmt, 1, SQL_C_TYPE_TIMESTAMP, &shipped_date_before, sizeof(shipped_date_before), NULL);
+
     SQLRETURN ret = SQLExecute(hstmt);
     if(!SQL_SUCCEEDED(ret)) {
         SQLExecDirect(hstmt, (SQLCHAR*)"ROLLBACK", SQL_NTS);
         SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
-        return;
+        return shipped_date_before;
     }
     SQLFetch(hstmt);
-    if(!check) {
-        printf("OrderID is not actual order\n");
-        SQLExecDirect(hstmt, (SQLCHAR*)"ROLLBACK", SQL_NTS);
-        SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
+    return shipped_date_before;
 
-    }
-    SQLFreeStmt(hstmt, SQL_CLOSE);
-    // before doing this need to make sure ship hasn't happened already
-    insert = (SQLCHAR*)"SELECT ShippedDate FROM Orders WHERE OrderID=?";
+}
+bool sufficientInventory(SQLHDBC dbc, SQLINTEGER oid, PRODUCT_INFO** products_available, size_t total_products) {
+    SQLHSTMT hstmt;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &hstmt);
+
+    // get ID pid and quantity for each order
+    SQLCHAR* insert = (SQLCHAR*)"SELECT ID, ProductID, Quantity FROM Order_Details WHERE OrderID=?";
     SQLPrepare(hstmt, insert, SQL_NTS);
     SQLBindParameter(hstmt, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &oid, 0, NULL);
-    SQL_TIMESTAMP_STRUCT shipped_date_before;
-     memset(&shipped_date_before, 0, sizeof(shipped_date_before));
+    SQLINTEGER odid;
+    SQLINTEGER odpid;
+    SQL_NUMERIC_STRUCT od_quantity;
+    SQLBindCol(hstmt, 1, SQL_INTEGER, &odid, sizeof(odid), NULL);
+    SQLBindCol(hstmt, 2, SQL_INTEGER, &odpid, sizeof(odpid), NULL);
+    SQLBindCol(hstmt, 3, SQL_C_NUMERIC, &od_quantity, sizeof(od_quantity), NULL);
+    SQLExecute(hstmt);
 
-    SQLBindCol(hstmt, 1, SQL_C_TYPE_TIMESTAMP, &shipped_date_before, sizeof(shipped_date_before), NULL);
-    ret = SQLExecute(hstmt);
-    if(!SQL_SUCCEEDED(ret)) {
-        SQLExecDirect(hstmt, (SQLCHAR*)"ROLLBACK", SQL_NTS);
-        SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
-        return;
+    // for each order in order_details
+    while(SQL_SUCCEEDED(SQLFetch(hstmt))) {
+        // figure out if the read product has enough in stock
+        double od_quantity_d = getDoubleFromSQLNumericStruct(&od_quantity);
+        for(int i = 0; i < total_products; i++) {
+            if(products_available[i]->pid == odpid) {
+                // comparing long long to double right now
+                if(products_available[i]->quantity_avail < od_quantity_d) {
+                    printf("Not enough product for %d\n", odpid);
+                    SQLExecDirect(hstmt, (SQLCHAR*)"ROLLBACK", SQL_NTS);
+                    SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
+                    return 0;
+                }
+            }
+        }
     }
-    SQLFetch(hstmt);
-    if(shipped_date_before.year!=0) {
-        printf("Order already shipped\n");
-        SQLExecDirect(hstmt, (SQLCHAR*)"ROLLBACK", SQL_NTS);
-        SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
-        return;
-    }
+    SQLExecDirect(hstmt, (SQLCHAR*)"COMMIT", SQL_NTS);
+    SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
+    return 1;
+}
+bool addProductsToInventoryTransactions(SQLHDBC dbc, SQLINTEGER oid) {
+    SQLHDBC hstmt;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &hstmt);
+    SQLExecDirect(hstmt, (SQLCHAR*)"BEGIN", SQL_NTS);
 
-    // go through each product in the order and see if there are sufficient products
-    SQLFreeStmt(hstmt, SQL_CLOSE);
-    insert = (SQLCHAR*)"SELECT ID, ProductID, Quantity FROM Order_Details WHERE OrderID=?";
+    SQLCHAR* insert = (SQLCHAR*)"SELECT ID, ProductID, Quantity FROM Order_Details WHERE OrderID=?";
     SQLPrepare(hstmt, insert, SQL_NTS);
     SQLBindParameter(hstmt, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &oid, 0, NULL);
+
     SQLINTEGER odid;
     SQLINTEGER odpid;
     SQL_NUMERIC_STRUCT od_quantity;
@@ -538,68 +533,123 @@ void shipOrder(SQLHDBC dbc) {
     SQLExecDirect(hstmt2, (SQLCHAR*)"BEGIN", SQL_NTS);
     while(SQL_SUCCEEDED(SQLFetch(hstmt))) {
         // figure out if the read product has enough in stock
-        double od_quantity_d = getDoubleFromSQLNumericStruct(&od_quantity);
-        SQLINTEGER od_quantity_INT = (SQLINTEGER) round(od_quantity_d);
-        for(int i = 0; i < total_products; i++) {
-            if(products_available[i]->pid == odpid) {
-                // not enough 
-                if(products_available[i]->quantity_avail < od_quantity_d) {
-                    printf("Rolling Back, not enough product for %d\n", odpid);
-                    SQLExecDirect(hstmt, (SQLCHAR*)"ROLLBACK", SQL_NTS);
-                    SQLExecDirect(hstmt2, (SQLCHAR*)"ROLLBACK", SQL_NTS);
-                    SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
-                    SQLFreeHandle(SQL_HANDLE_STMT, hstmt2);
-                    return;
-                }
-                else {
-                    // insert into inventory_transactions
-                    SQLFreeStmt(hstmt2, SQL_CLOSE);
-                    SQLCHAR* insert2 = (SQLCHAR*)"INSERT INTO Inventory_Transactions(TransactionType, TransactionCreatedDate, TransactionModifiedDate, ProductID, Quantity) VALUES (?, ?, ?, ?, ?)";
-                    SQLPrepare(hstmt2, insert2, SQL_NTS);
-                    SQLBindParameter(hstmt2, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &od_transaction_type, 0, NULL);
-                    SQLBindParameter(hstmt2, 2, SQL_PARAM_INPUT, SQL_C_TYPE_TIMESTAMP, SQL_TYPE_TIMESTAMP, 0, 0, &ship_date, 0, NULL);
-                    SQLBindParameter(hstmt2, 3, SQL_PARAM_INPUT, SQL_C_TYPE_TIMESTAMP, SQL_TYPE_TIMESTAMP, 0, 0, &ship_date, 0, NULL);
-                    SQLBindParameter(hstmt2, 4, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &odpid, 0, NULL);
-                    SQLBindParameter(hstmt2, 5, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &od_quantity_INT, 0, NULL);
-                    SQLRETURN ret = SQLExecute(hstmt2);
-                    if(!SQL_SUCCEEDED(ret)) {
-                        printf("Rolling Back bad insert into transactions\n");
-                        SQLExecDirect(hstmt2, (SQLCHAR*)"ROLLBACK", SQL_NTS);
-                        SQLExecDirect(hstmt, (SQLCHAR*)"ROLLBACK", SQL_NTS);
-                        SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
-                        SQLFreeHandle(SQL_HANDLE_STMT, hstmt2);
-                        return;
-                    }
-                }
-            }
+        // insert into inventory_transactions
+        SQLFreeStmt(hstmt2, SQL_CLOSE);
+        SQLCHAR* insert2 = (SQLCHAR*)"INSERT INTO Inventory_Transactions(TransactionType, TransactionCreatedDate, TransactionModifiedDate, ProductID, Quantity) VALUES (?, ?, ?, ?, ?)";
+        SQLPrepare(hstmt2, insert2, SQL_NTS);
+        SQLBindParameter(hstmt2, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &od_transaction_type, 0, NULL);
+        SQLBindParameter(hstmt2, 2, SQL_PARAM_INPUT, SQL_C_TYPE_TIMESTAMP, SQL_TYPE_TIMESTAMP, 0, 0, &ship_date, 0, NULL);
+        SQLBindParameter(hstmt2, 3, SQL_PARAM_INPUT, SQL_C_TYPE_TIMESTAMP, SQL_TYPE_TIMESTAMP, 0, 0, &ship_date, 0, NULL);
+        SQLBindParameter(hstmt2, 4, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &odpid, 0, NULL);
+
+        // it must be an int for this
+        SQLINTEGER od_quantity_int = (SQLINTEGER) round(getDoubleFromSQLNumericStruct(&od_quantity));
+        SQLBindParameter(hstmt2, 5, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &od_quantity_int, 0, NULL);
+        SQLRETURN ret = SQLExecute(hstmt2);
+        if(!SQL_SUCCEEDED(ret)) {
+            SQLExecDirect(hstmt, (SQLCHAR*)"ROLLBACK", SQL_NTS);
+            SQLExecDirect(hstmt2, (SQLCHAR*)"ROLLBACK", SQL_NTS);
+            SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
+            SQLFreeHandle(SQL_HANDLE_STMT, hstmt2);
+            return 0;
         }
     }
-    
-    // TODO if there are enough products fill in ShippedDate, ShipperID, ShippingFee
-    SQLFreeStmt(hstmt, SQL_CLOSE);
-    insert = (SQLCHAR*)"UPDATE Orders SET ShippedDate=?, ShipperID=?, ShippingFee=? WHERE OrderID=?";
+    SQLExecDirect(hstmt, (SQLCHAR*)"COMMIT", SQL_NTS);
+    SQLExecDirect(hstmt2, (SQLCHAR*)"COMMIT", SQL_NTS);
+    SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
+    SQLFreeHandle(SQL_HANDLE_STMT, hstmt2);
+    return 1;
+}
+bool updateOrders(SQLHDBC dbc, SQLINTEGER oid) {
+    // hstmt setup
+    SQLHSTMT hstmt;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &hstmt);
+    SQLExecDirect(hstmt, (SQLCHAR*)"BEGIN", SQL_NTS);
+
+    SQLCHAR* insert = (SQLCHAR*)"UPDATE Orders SET ShippedDate=?, ShipperID=?, ShippingFee=? WHERE OrderID=?";
     SQLPrepare(hstmt, insert, SQL_NTS);
+
+    // binding the attrs
+    SQL_TIMESTAMP_STRUCT ship_date = getSQLNow(dbc);
     SQLBindParameter(hstmt, 1, SQL_PARAM_INPUT, SQL_C_TYPE_TIMESTAMP, SQL_TYPE_TIMESTAMP, 0, 0, &ship_date, 0, NULL);
     printf("Enter the shippingID: ");
     SQLINTEGER* shipping_id = readAndBindInteger(hstmt, 2);
     printf("Enter the shipping Fee: ");
     SQL_NUMERIC_STRUCT* shipping_fee = readAndBindDecimal(hstmt, 3, 16, 4);
     SQLBindParameter(hstmt, 4, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &oid, 0, NULL);
-    ret = SQLExecute(hstmt);
+
+    SQLRETURN ret = SQLExecute(hstmt);
     if(!SQL_SUCCEEDED(ret)) {
-        printf("Rolling Back bad update\n");
-        SQLExecDirect(hstmt2, (SQLCHAR*)"ROLLBACK", SQL_NTS);
         SQLExecDirect(hstmt, (SQLCHAR*)"ROLLBACK", SQL_NTS);
         SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
-        SQLFreeHandle(SQL_HANDLE_STMT, hstmt2);
+        free(shipping_id);
+        free(shipping_fee);
+        return 0;
+    }
+    SQLExecDirect(hstmt, (SQLCHAR*)"COMMIT", SQL_NTS);
+    SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
+    free(shipping_id);
+    free(shipping_fee);
+    return 1;
+}
+void shipOrder(SQLHDBC dbc) {
+    // handle setup and starting transaction
+    SQLHSTMT hstmt;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &hstmt);
+    SQLExecDirect(hstmt, (SQLCHAR*)"BEGIN", SQL_NTS);
+    size_t total_products = 0;
+    // get information about every productID
+    PRODUCT_INFO** products_available = read_products(dbc, &total_products);
+
+    char* input = NULL;
+    size_t n = 0;
+    // ask for the orderID that should be shipped
+    printf("Enter orderID to be shipped: ");
+    getline(&input, &n, stdin);
+    SQLINTEGER oid = atoi(input);
+    free(input);
+
+    if(!orderExists(dbc, oid)) {
+        printf("OrderID is not actual order\n");
+        rollbackCleanupShip(products_available, total_products, hstmt);
+        return;
+
+    }
+    SQL_TIMESTAMP_STRUCT shipped_date_before = getShippedDate(dbc, oid); 
+    if(shipped_date_before.year!=0) {
+        printf("Order already shipped\n");
+        rollbackCleanupShip(products_available, total_products, hstmt);
+        return;
+    }
+    if(!sufficientInventory(dbc, oid, products_available, total_products)) {
+        rollbackCleanupShip(products_available, total_products, hstmt);
+        return;
+    }
+    if(!addProductsToInventoryTransactions(dbc, oid)) {
+        printf("Rolling Back bad insert into transactions\n");
+        rollbackCleanupShip(products_available, total_products, hstmt);
+        return;
+    }
+    if(!updateOrders(dbc, oid)) {
+        printf("Rolling Back bad update\n");
+        rollbackCleanupShip(products_available, total_products, hstmt);
         return;
     }
     SQLExecDirect(hstmt, (SQLCHAR*)"COMMIT", SQL_NTS);
-    SQLExecDirect(hstmt2, (SQLCHAR*)"COMMIT", SQL_NTS);
-
     SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
-    SQLFreeHandle(SQL_HANDLE_STMT, hstmt2);
-    free(input);
+    for(int i = 0; i < total_products; i++) {
+        free(products_available[i]);
+    }
+    free(products_available);
+}
+void rollbackCleanupShip(PRODUCT_INFO** products_available, size_t total_products, SQLHSTMT hstmt) {
+    SQLExecDirect(hstmt, (SQLCHAR*)"ROLLBACK", SQL_NTS);
+    SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
+    // cleanup
+    for(int i = 0; i < total_products; i++) {
+        free(products_available[i]);
+    }
+    free(products_available);
 }
 
 void printPendingOrders(SQLHDBC dbc) {
